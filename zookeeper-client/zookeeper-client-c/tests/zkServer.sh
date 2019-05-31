@@ -21,9 +21,30 @@ ZOOPORT=22181
 
 if [ "x$1" == "x" ]
 then
-    echo "USAGE: $0 startClean|start|startReadOnly|stop hostPorts"
+    echo "USAGE: $0 startClean|start|startReadOnly|stop hostPorts [-sasl] [-verbose]"
     exit 2
 fi
+
+for var in "$@"
+do
+    if [[ "x$var" != "x0" && "x$var" != "x1" && "x$var" != "x2" ]]
+    then
+        if [ "$var" == "-sasl" ]
+        then
+            SASLCONFFILE=tests/jaas.digest.server.conf
+            if [ "x${base_dir}" != "x" ]
+            then
+                SASLCONFFILE=${base_dir}/zookeeper-client/zookeeper-client-c/$SASLCONFFILE
+            fi
+            JVMARGS=$JVMARGS\ -Dzookeeper.authProvider.1=org.apache.zookeeper.server.auth.SASLAuthenticationProvider
+            JVMARGS=$JVMARGS\ -Djava.security.auth.login.config=$SASLCONFFILE
+        fi
+        if [ "$var" == "-verbose" ]
+        then
+            JVMARGS=$JVMARGS\ -Dzookeeper.root.logger=DEBUG,CONSOLE\ -Dzookeeper.console.threshold=DEBUG
+        fi
+    fi
+done
 
 case "`uname`" in
     CYGWIN*) cygwin=true ;;
@@ -113,12 +134,12 @@ start|startClean)
     if [ "x${base_dir}" == "x" ]
     then
         mkdir -p /tmp/zkdata
-        java -cp "$CLASSPATH" org.apache.zookeeper.server.ZooKeeperServerMain $ZOOPORT /tmp/zkdata 3000 $ZKMAXCNXNS &> /tmp/zk.log &
+        java -cp "$CLASSPATH" $JVMARGS org.apache.zookeeper.server.ZooKeeperServerMain $ZOOPORT /tmp/zkdata 3000 $ZKMAXCNXNS &> /tmp/zk.log &
         pid=$!
         echo -n $! > /tmp/zk.pid
     else
         mkdir -p "${base_dir}/build/tmp/zkdata"
-        java -cp "$CLASSPATH" org.apache.zookeeper.server.ZooKeeperServerMain $ZOOPORT "${base_dir}/build/tmp/zkdata" 3000 $ZKMAXCNXNS &> "${base_dir}/build/tmp/zk.log" &
+        java -cp "$CLASSPATH" $JVMARGS org.apache.zookeeper.server.ZooKeeperServerMain $ZOOPORT "${base_dir}/build/tmp/zkdata" 3000 $ZKMAXCNXNS &> "${base_dir}/build/tmp/zk.log" &
         pid=$!
         echo -n $pid > "${base_dir}/build/tmp/zk.pid"
     fi
@@ -170,7 +191,7 @@ startReadOnly)
         sed "s#TMPDIR#${tmpdir}#g" ${base_dir}/zookeeper-client/zookeeper-client-c/tests/quorum.cfg > "${tmpdir}/quorum.cfg"
 
         # force read-only mode
-        java -cp "$CLASSPATH" -Dreadonlymode.enabled=true org.apache.zookeeper.server.quorum.QuorumPeerMain ${tmpdir}/quorum.cfg &> "${tmpdir}/zk.log" &
+        java -cp "$CLASSPATH" $JVMARGS -Dreadonlymode.enabled=true org.apache.zookeeper.server.quorum.QuorumPeerMain ${tmpdir}/quorum.cfg &> "${tmpdir}/zk.log" &
         pid=$!
         echo -n $pid > "${base_dir}/build/tmp/zk.pid"
         sleep 3 # wait until read-only server is up

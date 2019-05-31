@@ -182,6 +182,7 @@ struct ACL_vector ZOO_CREATOR_ALL_ACL = { 1, _CREATOR_ALL_ACL_ACL};
 #define COMPLETION_STRING 6
 #define COMPLETION_MULTI 7
 #define COMPLETION_STRING_STAT 8
+#define COMPLETION_SASL 9
 
 typedef struct _auth_completion_list {
     void_completion_t completion;
@@ -200,6 +201,7 @@ typedef struct completion {
         acl_completion_t acl_result;
         string_completion_t string_result;
         string_stat_completion_t string_stat_result;
+        sasl_completion_t sasl_result;
         struct watcher_object_list *watcher_result;
     };
     completion_head_t clist; /* For multi-op */
@@ -1688,6 +1690,17 @@ void free_completions(zhandle_t *zh,int callCompletion,int reason)
 #else
                 abort_singlethreaded(zh);
 #endif
+            } else if (cptr->c.sasl_result == SYNCHRONOUS_MARKER) {
+#ifdef THREADED
+                struct sync_completion
+                            *sc = (struct sync_completion*)cptr->data;
+                sc->rc = reason;
+                notify_sync_completion(sc);
+                zh->outstanding_sync--;
+                destroy_completion_entry(cptr);
+#else
+                abort_singlethreaded(zh);
+#endif
             } else if (callCompletion) {
                 // Fake the response
                 buffer_list_t *bptr;
@@ -2759,6 +2772,25 @@ static void deserialize_response(zhandle_t *zh, int type, int xid, int failed, i
         }
         cptr->c.void_result(rc, cptr->data);
         break;
+    case COMPLETION_SASL:
+        if (sc->rc==0) {
+            struct SetSASLResponse res;
+            int len;
+            deserialize_SetSASLResponse(ia, "reply", &res);
+            if (res.token.len <= sc->u.sasl.token_len) {
+                len = res.token.len;
+            } else {
+                len = sc->u.data.buff_len;
+            }
+            sc->u.sasl.token_len = len;
+            if (len == -1) {
+                sc->u.sasl.token = NULL;
+            } else {
+                memcpy(sc->u.sasl.token, res.token.buff, len);
+            }
+            deallocate_SetSASLResponse(&res);
+        }
+        break;
     default:
         LOG_DEBUG(LOGCALLBACK(zh), "Unsupported completion type=%d", cptr->c.type);
     }
@@ -3078,6 +3110,9 @@ static completion_list_t* do_create_completion_entry(zhandle_t *zh, int xid,
         c->c.void_result = (void_completion_t)dc;
         c->c.clist = *clist;
         break;
+    case COMPLETION_SASL:
+        c->c.sasl_result = (sasl_completion_t)dc;
+        break;
     }
     c->xid = xid;
     c->watcher = wo;
@@ -3220,6 +3255,12 @@ static int add_multi_completion(zhandle_t *zh, int xid, void_completion_t dc,
         const void *data, completion_head_t *clist)
 {
     return add_completion(zh, xid, COMPLETION_MULTI, dc, data, 0,0, clist);
+}
+
+static int add_sasl_completion(zhandle_t *zh, int xid, sasl_completion_t dc,
+        const void *data, completion_head_t *clist)
+{
+    return add_completion(zh, xid, COMPLETION_SASL, dc, data, 0,0, clist);
 }
 
 int zookeeper_close(zhandle_t *zh)
@@ -4551,6 +4592,23 @@ static void process_sync_completion(zhandle_t *zh,
     case COMPLETION_MULTI:
         sc->rc = deserialize_multi(zh, cptr->xid, cptr, ia);
         break;
+    case COMPLETION_SASL:
+        LOG_DEBUG(
+                ("Calling COMPLETION_SASL for xid=%#x failed=%d rc=%d", cptr->xid, failed, rc));
+        if (failed) {
+            struct sasl_completion_ctx *sctx =
+                    (struct sasl_completion_ctx *) cptr->data;
+            cptr->c.sasl_result(rc, sctx->zh, sctx->conn, NULL, 0);
+        } else {
+            struct sasl_completion_ctx *sctx =
+                    (struct sasl_completion_ctx *) cptr->data;
+            struct SetSASLResponse res;
+            deserialize_SetSASLResponse(ia, "reply", &res);
+            cptr->c.sasl_result(rc, sctx->zh, sctx->conn,
+                    res.token.buff, res.token.len);
+            deallocate_SetSASLResponse(&res);
+        }
+        break;
     default:
         LOG_DEBUG(LOGCALLBACK(zh), "Unsupported completion type=%d", cptr->c.type);
         break;
@@ -4942,4 +5000,78 @@ int zoo_aremove_all_watches(zhandle_t *zh, const char *path,
 {
     return aremove_watches(
         zh, path, wtype, NULL, NULL, local, completion, data, 1);
+}
+
+static int queue_sasl_request(zhandle_t *zh, const char *data, unsigned len, void* cptr,
+        void *ctx) {
+    struct oarchive *oa;
+    int rc;
+
+    LOG_DEBUG(("saslToken (client) length: %d", len));
+
+    struct RequestHeader h = { STRUCT_INITIALIZER(xid , get_xid()),
+            STRUCT_INITIALIZER(type , ZOO_SASL_OP) };
+    struct GetSASLRequest req = { { STRUCT_INITIALIZER(len, len),
+            STRUCT_INITIALIZER(buff, len>0 ? (char *) data : "") } };
+
+    oa = create_buffer_oarchive();
+    rc = serialize_RequestHeader(oa, "header", &h);
+    rc = rc < 0 ? rc : serialize_GetSASLRequest(oa, "req", &req);
+
+    enter_critical(zh);
+    rc = rc < 0 ? rc : add_sasl_completion(zh, h.xid, cptr, ctx, NULL);
+    rc = rc < 0 ? rc : queue_buffer_bytes(&zh->to_send, get_buffer(oa),
+            get_buffer_len(oa));
+    leave_critical(zh);
+    close_buffer_oarchive(&oa, 0);
+
+    LOG_DEBUG(
+            ("Sending sasl token request xid=%#x to %s", h.xid, format_current_endpoint_info(zh)));
+    adaptor_send_queue(zh, 0);
+    return (rc < 0) ? ZMARSHALLINGERROR : ZOK;
+}
+
+int zoo_sasl(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *clientout,
+        unsigned clientoutlen, const char **serverin, unsigned *serverinlen) {
+    int rc;
+    char buf[8192];
+
+    struct sync_completion *sc = alloc_sync_completion();
+    if (!sc) {
+        return ZSYSTEMERROR;
+    }
+    sc->u.sasl.token = buf;
+    sc->u.sasl.token_len = sizeof(buf);
+
+    rc = queue_sasl_request(zh, clientout, clientoutlen, SYNCHRONOUS_MARKER, sc);
+
+    if(rc==ZOK){
+        wait_sync_completion(sc);
+        rc = sc->rc;
+        if(rc == ZOK && sc->u.sasl.token_len > 0) {
+            *serverin = sc->u.sasl.token;
+            *serverinlen = sc->u.sasl.token_len;
+        } else {
+            serverinlen = 0;
+            *serverin = NULL;
+        }
+    }
+    free_sync_completion(sc);
+
+    return rc;
+}
+
+int zoo_asasl(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *clientout,
+        unsigned clientoutlen, sasl_completion_t cptr) {
+    int r;
+    struct sasl_completion_ctx *sctx =
+            (struct sasl_completion_ctx *) malloc(
+                    sizeof(struct sasl_completion_ctx));
+    sctx->zh = zh;
+    sctx->conn = conn;
+
+    r = queue_sasl_request(zh, clientout, clientoutlen, cptr, sctx);
+    free(sctx);
+
+    return r;
 }
