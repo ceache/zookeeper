@@ -28,10 +28,11 @@ extern "C" {
 /**
  * \brief initialize sasl library
  *
+ * \param zh the zookeeper handle obtained by a call to \ref zookeeper_init
  * \param callbacks sasl callbacks
  * \return ZSYSTEMERROR if initialization failed
  */
-ZOOAPI int zoo_sasl_init(sasl_callback_t *callbacks);
+ZOOAPI int zoo_sasl_init(zhandle_t *zh, sasl_callback_t *callbacks);
 
 /**
  * \brief creates a sasl connection for the zookeeper socket

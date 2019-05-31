@@ -2666,6 +2666,12 @@ static int deserialize_multi(zhandle_t *zh, int xid, completion_list_t *cptr, st
     return rc;
 }
 
+// XXX: Find place for this
+struct sasl_completion_ctx {
+    zhandle_t *zh;
+    zoo_sasl_conn_t *ctx;
+};
+
 static void deserialize_response(zhandle_t *zh, int type, int xid, int failed, int rc, completion_list_t *cptr, struct iarchive *ia)
 {
     switch (type) {
@@ -2773,24 +2779,23 @@ static void deserialize_response(zhandle_t *zh, int type, int xid, int failed, i
         cptr->c.void_result(rc, cptr->data);
         break;
     case COMPLETION_SASL:
-        if (sc->rc==0) {
+        LOG_DEBUG(LOGCALLBACK(zh),
+                  "Calling COMPLETION_SASL for xid=%#x failed=%d rc=%d", cptr->xid, failed, rc);
+        if (failed) {
+            struct sasl_completion_ctx *sctx =
+                    (struct sasl_completion_ctx *) cptr->data;
+            cptr->c.sasl_result(rc, sctx->zh, sctx->ctx, NULL, 0);
+        } else {
+            struct sasl_completion_ctx *sctx =
+                    (struct sasl_completion_ctx *) cptr->data;
             struct SetSASLResponse res;
-            int len;
             deserialize_SetSASLResponse(ia, "reply", &res);
-            if (res.token.len <= sc->u.sasl.token_len) {
-                len = res.token.len;
-            } else {
-                len = sc->u.data.buff_len;
-            }
-            sc->u.sasl.token_len = len;
-            if (len == -1) {
-                sc->u.sasl.token = NULL;
-            } else {
-                memcpy(sc->u.sasl.token, res.token.buff, len);
-            }
+            cptr->c.sasl_result(rc, sctx->zh, sctx->ctx,
+                    res.token.buff, res.token.len);
             deallocate_SetSASLResponse(&res);
         }
         break;
+
     default:
         LOG_DEBUG(LOGCALLBACK(zh), "Unsupported completion type=%d", cptr->c.type);
     }
@@ -4420,6 +4425,35 @@ int zoo_add_auth(zhandle_t *zh,const char* scheme,const char* cert,
     return ZOK;
 }
 
+static int queue_sasl_request(zhandle_t *zh, const char *data, unsigned len, void* cptr,
+        void *ctx) {
+    struct oarchive *oa;
+    struct RequestHeader h = {get_xid(), ZOO_SASL_OP};
+    struct GetSASLRequest req = {{
+        len,
+        len>0 ? (char *) data : ""
+    }};
+    int rc;
+
+    LOG_DEBUG(LOGCALLBACK(zh), "saslToken (client) length: %d", len);
+
+    oa = create_buffer_oarchive();
+    rc = serialize_RequestHeader(oa, "header", &h);
+    rc = rc < 0 ? rc : serialize_GetSASLRequest(oa, "req", &req);
+
+    enter_critical(zh);
+    rc = rc < 0 ? rc : add_sasl_completion(zh, h.xid, cptr, ctx, NULL);
+    rc = rc < 0 ? rc : queue_buffer_bytes(&zh->to_send, get_buffer(oa),
+            get_buffer_len(oa));
+    leave_critical(zh);
+    close_buffer_oarchive(&oa, 0);
+
+    LOG_DEBUG(LOGCALLBACK(zh),
+              "Sending sasl token request xid=%#x to %s", h.xid, format_endpoint_info(&zh->addr_cur));
+    adaptor_send_queue(zh, 0);
+    return (rc < 0) ? ZMARSHALLINGERROR : ZOK;
+}
+
 static const char* format_endpoint_info(const struct sockaddr_storage* ep)
 {
     static char buf[128] = { 0 };
@@ -4593,19 +4627,21 @@ static void process_sync_completion(zhandle_t *zh,
         sc->rc = deserialize_multi(zh, cptr->xid, cptr, ia);
         break;
     case COMPLETION_SASL:
-        LOG_DEBUG(
-                ("Calling COMPLETION_SASL for xid=%#x failed=%d rc=%d", cptr->xid, failed, rc));
-        if (failed) {
-            struct sasl_completion_ctx *sctx =
-                    (struct sasl_completion_ctx *) cptr->data;
-            cptr->c.sasl_result(rc, sctx->zh, sctx->conn, NULL, 0);
-        } else {
-            struct sasl_completion_ctx *sctx =
-                    (struct sasl_completion_ctx *) cptr->data;
+        if (sc->rc==0) {
             struct SetSASLResponse res;
+            int len;
             deserialize_SetSASLResponse(ia, "reply", &res);
-            cptr->c.sasl_result(rc, sctx->zh, sctx->conn,
-                    res.token.buff, res.token.len);
+            if (res.token.len <= sc->u.sasl.token_len) {
+                len = res.token.len;
+            } else {
+                len = sc->u.data.buff_len;
+            }
+            sc->u.sasl.token_len = len;
+            if (len == -1) {
+                sc->u.sasl.token = NULL;
+            } else {
+                memcpy(sc->u.sasl.token, res.token.buff, len);
+            }
             deallocate_SetSASLResponse(&res);
         }
         break;
@@ -4984,52 +5020,6 @@ int zoo_remove_all_watches(
     return remove_watches(zh, path, wtype, NULL, NULL, local, 1);
 
 }
-#endif
-
-int zoo_aremove_watches(zhandle_t *zh, const char *path, ZooWatcherType wtype,
-        watcher_fn watcher, void *watcherCtx, int local,
-        void_completion_t *completion, const void *data)
-{
-    return aremove_watches(
-        zh, path, wtype, watcher, watcherCtx, local, completion, data, 0);
-}
-
-int zoo_aremove_all_watches(zhandle_t *zh, const char *path,
-        ZooWatcherType wtype, int local, void_completion_t *completion,
-        const void *data)
-{
-    return aremove_watches(
-        zh, path, wtype, NULL, NULL, local, completion, data, 1);
-}
-
-static int queue_sasl_request(zhandle_t *zh, const char *data, unsigned len, void* cptr,
-        void *ctx) {
-    struct oarchive *oa;
-    int rc;
-
-    LOG_DEBUG(("saslToken (client) length: %d", len));
-
-    struct RequestHeader h = { STRUCT_INITIALIZER(xid , get_xid()),
-            STRUCT_INITIALIZER(type , ZOO_SASL_OP) };
-    struct GetSASLRequest req = { { STRUCT_INITIALIZER(len, len),
-            STRUCT_INITIALIZER(buff, len>0 ? (char *) data : "") } };
-
-    oa = create_buffer_oarchive();
-    rc = serialize_RequestHeader(oa, "header", &h);
-    rc = rc < 0 ? rc : serialize_GetSASLRequest(oa, "req", &req);
-
-    enter_critical(zh);
-    rc = rc < 0 ? rc : add_sasl_completion(zh, h.xid, cptr, ctx, NULL);
-    rc = rc < 0 ? rc : queue_buffer_bytes(&zh->to_send, get_buffer(oa),
-            get_buffer_len(oa));
-    leave_critical(zh);
-    close_buffer_oarchive(&oa, 0);
-
-    LOG_DEBUG(
-            ("Sending sasl token request xid=%#x to %s", h.xid, format_current_endpoint_info(zh)));
-    adaptor_send_queue(zh, 0);
-    return (rc < 0) ? ZMARSHALLINGERROR : ZOK;
-}
 
 int zoo_sasl(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *clientout,
         unsigned clientoutlen, const char **serverin, unsigned *serverinlen) {
@@ -5061,6 +5051,24 @@ int zoo_sasl(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *clientout,
     return rc;
 }
 
+#endif
+
+int zoo_aremove_watches(zhandle_t *zh, const char *path, ZooWatcherType wtype,
+        watcher_fn watcher, void *watcherCtx, int local,
+        void_completion_t *completion, const void *data)
+{
+    return aremove_watches(
+        zh, path, wtype, watcher, watcherCtx, local, completion, data, 0);
+}
+
+int zoo_aremove_all_watches(zhandle_t *zh, const char *path,
+        ZooWatcherType wtype, int local, void_completion_t *completion,
+        const void *data)
+{
+    return aremove_watches(
+        zh, path, wtype, NULL, NULL, local, completion, data, 1);
+}
+
 int zoo_asasl(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *clientout,
         unsigned clientoutlen, sasl_completion_t cptr) {
     int r;
@@ -5068,7 +5076,7 @@ int zoo_asasl(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *clientout,
             (struct sasl_completion_ctx *) malloc(
                     sizeof(struct sasl_completion_ctx));
     sctx->zh = zh;
-    sctx->conn = conn;
+    sctx->ctx = conn;
 
     r = queue_sasl_request(zh, clientout, clientoutlen, cptr, sctx);
     free(sctx);

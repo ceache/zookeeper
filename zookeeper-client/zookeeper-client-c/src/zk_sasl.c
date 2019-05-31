@@ -29,11 +29,25 @@
 #define SAMPLE_SEC_BUF_SIZE (2048)
 
 
-static int sasl_proceed(int sr, zhandle_t *zh, zoo_sasl_conn_t *conn,
-        const char *clientout, int clientoutlen, int sync);
+static int _zsasl_complete(int rc, zhandle_t *zh, zoo_sasl_conn_t *conn,
+                           const char *serverin, int serverinlen) {
+    if (rc != ZOK) {
+        LOG_ERROR(LOGCALLBACK(zh), "Reading sasl response failed: %d", rc);
+        return rc;
+    }
 
-static int sasl_auth(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *mech,
-        const char *supportedmechs, int sync) {
+    LOG_DEBUG(LOGCALLBACK(zh), "SASL Authentication complete [%d]", rc);
+    return rc;
+}
+
+
+#if THREADED
+
+static int _zsasl_proceed(int sr, zhandle_t *zh, zoo_sasl_conn_t *conn,
+        const char *clientout, int clientoutlen);
+
+static int _zsasl_auth(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *mech,
+        const char *supportedmechs) {
     const char *clientout;
     const char *chosenmech;
     unsigned clientoutlen;
@@ -48,7 +62,8 @@ static int sasl_auth(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *mech,
 
     if (mech) {
         if (!strstr(supportedmechs, mech)) {
-            LOG_DEBUG(("client doesn't support mandatory mech '%s'\n", mech));
+            LOG_DEBUG(LOGCALLBACK(zh),
+                "client doesn't support mandatory mech '%s'\n", mech);
             return ZSYSTEMERROR;
         }
     }
@@ -56,22 +71,12 @@ static int sasl_auth(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *mech,
     sr = sasl_client_start((sasl_conn_t *) conn, mech, NULL, &clientout, &clientoutlen,
             &chosenmech);
 
-    LOG_DEBUG(("SASL Authentication mechanism: %s", chosenmech));
+    LOG_DEBUG(LOGCALLBACK(zh), "SASL Authentication mechanism: %s", chosenmech);
 
-    return sasl_proceed(sr, zh, conn, clientout, clientoutlen, sync);
+    return _zsasl_proceed(sr, zh, conn, clientout, clientoutlen);
 }
 
-int zoo_sasl_authenticate(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *mech,
-        const char *supportedmechs) {
-    return sasl_auth(zh, conn, mech, supportedmechs, 1);
-}
-
-int zoo_asasl_authenticate(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *mech,
-        const char *supportedmechs) {
-    return sasl_auth(zh, conn, mech, supportedmechs, 0);
-}
-
-static int sasl_step(int rc, zhandle_t *zh, zoo_sasl_conn_t *conn, int sync,
+static int _zsasl_step(int rc, zhandle_t *zh, zoo_sasl_conn_t *conn,
         const char *serverin, int serverinlen) {
     const char *clientout;
     unsigned clientoutlen;
@@ -79,70 +84,139 @@ static int sasl_step(int rc, zhandle_t *zh, zoo_sasl_conn_t *conn, int sync,
     int r = rc;
 
     if (r != ZOK) {
-        LOG_ERROR(("Reading sasl response failed: %d", r));
+        LOG_ERROR(LOGCALLBACK(zh), "Reading sasl response failed: %d", r);
         return r;
     }
 
     sr = sasl_client_step((sasl_conn_t *) conn, serverin, serverinlen, NULL, &clientout,
             &clientoutlen);
 
-    return sasl_proceed(sr, zh, conn, clientout, clientoutlen, sync);
+    return _zsasl_proceed(sr, zh, conn, clientout, clientoutlen);
 }
 
-static int sasl_step_async(int rc, zhandle_t *zh, zoo_sasl_conn_t *conn,
-        const char *serverin, int serverinlen) {
-    return sasl_step(rc, zh, conn, 0, serverin, serverinlen);
-}
-
-static int sasl_complete(int rc, zhandle_t *zh, zoo_sasl_conn_t *conn,
-        const char *serverin, int serverinlen) {
-    if (rc != ZOK) {
-        LOG_ERROR(("Reading sasl response failed: %d", rc));
-        return rc;
-    }
-
-    LOG_DEBUG(("SASL Authentication complete [%d]", rc));
-    return rc;
-}
-
-static int sasl_proceed(int sr, zhandle_t *zh, zoo_sasl_conn_t *conn,
-        const char *clientout, int clientoutlen, int sync) {
+static int _zsasl_proceed(int sr, zhandle_t *zh, zoo_sasl_conn_t *conn,
+        const char *clientout, int clientoutlen) {
     int r = ZOK;
     const char *serverin;
     unsigned serverinlen;
 
     if (sr != SASL_OK && sr != SASL_CONTINUE) {
-        LOG_ERROR(("starting SASL negotiation: %s %s",
-                sasl_errstring(sr, NULL, NULL),
-                sasl_errdetail((sasl_conn_t *) conn)));
+        LOG_ERROR(LOGCALLBACK(zh),
+                  "starting SASL negotiation: %s %s",
+                  sasl_errstring(sr, NULL, NULL),
+                  sasl_errdetail((sasl_conn_t *) conn));
         return ZSYSTEMERROR;
     }
 
     if (sr == SASL_CONTINUE || clientoutlen > 0) {
-        if(sync) {
-            r = zoo_sasl(zh, conn, clientout, clientoutlen, &serverin, &serverinlen);
-            if (sr == SASL_CONTINUE) {
-                r = sasl_step(r, zh, conn, sync, serverin, serverinlen);
-            } else {
-                r = sasl_complete(r, zh, conn, serverin, serverinlen);
-            }
+        r = zoo_sasl(zh, conn, clientout, clientoutlen, &serverin, &serverinlen);
+        if (sr == SASL_CONTINUE) {
+            r = _zsasl_step(r, zh, conn, serverin, serverinlen);
         } else {
-            r = zoo_asasl(zh, conn, clientout, clientoutlen,
-                           (sr == SASL_CONTINUE) ? sasl_step_async : sasl_complete);
+            r = _zsasl_complete(r, zh, conn, serverin, serverinlen);
         }
     }
+
     if (r != ZOK) {
-        LOG_ERROR(("Sending sasl request failed: %d", r));
+        LOG_ERROR(LOGCALLBACK(zh), "Sending sasl request failed: %d", r);
         return r;
     }
     return r;
 }
 
-int zoo_sasl_init(sasl_callback_t *callbacks) {
+int zoo_sasl_authenticate(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *mech,
+        const char *supportedmechs) {
+    return _zsasl_auth(zh, conn, mech, supportedmechs);
+}
+
+#endif  /* !THREADED */
+
+static int _zasasl_proceed(int sr, zhandle_t *zh, zoo_sasl_conn_t *conn,
+                           const char *clientout, int clientoutlen);
+
+static int _zasasl_auth(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *mech,
+                        const char *supportedmechs) {
+    const char *clientout;
+    const char *chosenmech;
+    unsigned clientoutlen;
+    int sr = 0;
+
+    /*
+     if (supportedmechs) {
+     serverin = (char *) malloc(strlen(supportedmechs));
+     strncpy(serverin, supportedmechs, strlen(supportedmechs));
+     }
+     */
+
+    if (mech) {
+        if (!strstr(supportedmechs, mech)) {
+            LOG_DEBUG(LOGCALLBACK(zh),
+                "client doesn't support mandatory mech '%s'\n", mech);
+            return ZSYSTEMERROR;
+        }
+    }
+
+    sr = sasl_client_start((sasl_conn_t *) conn, mech, NULL, &clientout, &clientoutlen,
+            &chosenmech);
+
+    LOG_DEBUG(LOGCALLBACK(zh), "SASL Authentication mechanism: %s", chosenmech);
+
+    return _zasasl_proceed(sr, zh, conn, clientout, clientoutlen);
+}
+
+static int _zasasl_step(int rc, zhandle_t *zh, zoo_sasl_conn_t *conn,
+                        const char *serverin, int serverinlen) {
+    const char *clientout;
+    unsigned clientoutlen;
+    int sr;
+    int r = rc;
+
+    if (r != ZOK) {
+        LOG_ERROR(LOGCALLBACK(zh), "Reading sasl response failed: %d", r);
+        return r;
+    }
+
+    sr = sasl_client_step((sasl_conn_t *) conn, serverin, serverinlen, NULL, &clientout,
+            &clientoutlen);
+
+    return _zasasl_proceed(sr, zh, conn, clientout, clientoutlen);
+}
+
+static int _zasasl_proceed(int sr, zhandle_t *zh, zoo_sasl_conn_t *conn,
+                           const char *clientout, int clientoutlen) {
+    int r = ZOK;
+
+    if (sr != SASL_OK && sr != SASL_CONTINUE) {
+        LOG_ERROR(LOGCALLBACK(zh),
+                  "starting SASL negotiation: %s %s",
+                  sasl_errstring(sr, NULL, NULL),
+                  sasl_errdetail((sasl_conn_t *) conn));
+        return ZSYSTEMERROR;
+    }
+
+    if (sr == SASL_CONTINUE || clientoutlen > 0) {
+        r = zoo_asasl(zh, conn, clientout, clientoutlen,
+                        (sr == SASL_CONTINUE) ? _zasasl_step : _zsasl_complete);
+    }
+
+    if (r != ZOK) {
+        LOG_ERROR(LOGCALLBACK(zh), "Sending sasl request failed: %d", r);
+        return r;
+    }
+    return r;
+}
+
+int zoo_asasl_authenticate(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *mech,
+        const char *supportedmechs) {
+    return _zasasl_auth(zh, conn, mech, supportedmechs);
+}
+
+
+int zoo_sasl_init(zhandle_t *zh, sasl_callback_t *callbacks) {
     int rc = sasl_client_init(callbacks);
     if (rc != SASL_OK) {
-        LOG_ERROR(
-                ("initializing libsasl: %s", sasl_errstring(rc, NULL, NULL)));
+        LOG_ERROR(LOGCALLBACK(zh),
+                  "initializing libsasl: %s", sasl_errstring(rc, NULL, NULL));
         rc = ZSYSTEMERROR;
     } else {
         rc = ZOK;
@@ -166,7 +240,7 @@ int zoo_sasl_connect(zhandle_t *zh, char *servicename, char *host, zoo_sasl_conn
     salen = sizeof(local_ip);
     if (getsockname(zh->fd, (struct sockaddr *) &local_ip,
                     (unsigned *) &salen) < 0) {
-        LOG_ERROR(("getsockname"));
+        LOG_ERROR(LOGCALLBACK(zh), "getsockname");
         return ZSYSTEMERROR;
     }
 
@@ -178,7 +252,7 @@ int zoo_sasl_connect(zhandle_t *zh, char *servicename, char *host, zoo_sasl_conn
     error = getnameinfo((struct sockaddr *) &local_ip, salen, hbuf,
             sizeof(hbuf), pbuf, sizeof(pbuf), niflags);
     if (error != 0) {
-        LOG_ERROR(("getnameinfo: %s\n", gai_strerror(error)));
+        LOG_ERROR(LOGCALLBACK(zh), "getnameinfo: %s\n", gai_strerror(error));
         strcpy(hbuf, "unknown");
         strcpy(pbuf, "unknown");
         return ZSYSTEMERROR;
@@ -188,7 +262,7 @@ int zoo_sasl_connect(zhandle_t *zh, char *servicename, char *host, zoo_sasl_conn
     salen = sizeof(remote_ip);
     if (getpeername(zh->fd, (struct sockaddr *) &remote_ip,
                     (unsigned *) &salen) < 0) {
-        LOG_ERROR(("getpeername"));
+        LOG_ERROR(LOGCALLBACK(zh), "getpeername");
         return ZSYSTEMERROR;
     }
 
@@ -200,15 +274,16 @@ int zoo_sasl_connect(zhandle_t *zh, char *servicename, char *host, zoo_sasl_conn
     error = getnameinfo((struct sockaddr *) &remote_ip, salen, hbuf,
             sizeof(hbuf), pbuf, sizeof(pbuf), niflags);
     if (error != 0) {
-        LOG_ERROR(("getnameinfo: %s\n", gai_strerror(error)));
+        LOG_ERROR(LOGCALLBACK(zh), "getnameinfo: %s\n", gai_strerror(error));
         strcpy(hbuf, "unknown");
         strcpy(pbuf, "unknown");
         return ZSYSTEMERROR;
     }
     snprintf(remoteaddr, sizeof(remoteaddr), "%s;%s", hbuf, pbuf);
 
-    LOG_DEBUG(
-            ("Zookeeper Host: %s %s %s", "ubook", localaddr, remoteaddr));
+    LOG_DEBUG(LOGCALLBACK(zh),
+              "Zookeeper Host: %s %s %s",
+              "ubook", localaddr, remoteaddr); // XXX: FIXME
 
     /*
      memset(&secprops, 0L, sizeof(secprops));
@@ -221,8 +296,9 @@ int zoo_sasl_connect(zhandle_t *zh, char *servicename, char *host, zoo_sasl_conn
     r = sasl_client_new(servicename, host ? host : hbuf, localaddr, remoteaddr,
             NULL, 0, &conn);
     if (r != SASL_OK) {
-        LOG_ERROR(
-                ("allocating connection state: %s %s", sasl_errstring(r, NULL, NULL), sasl_errdetail(conn)));
+        LOG_ERROR(LOGCALLBACK(zh),
+            "allocating connection state: %s %s",
+            sasl_errstring(r, NULL, NULL), sasl_errdetail(conn));
         return ZSYSTEMERROR;
     } else {
         r = ZOK;

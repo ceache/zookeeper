@@ -133,42 +133,6 @@ enum ZOO_ERRORS {
   ZRECONFIGDISABLED = -123 /*!< Attempts to perform a reconfiguration operation when reconfiguration feature is disabled */
 };
 
-typedef struct zoo_sasl_conn zoo_sasl_conn_t;
-
-typedef int (*sasl_completion_t)(int rc, zhandle_t *zh, zoo_sasl_conn_t *conn,
-        const char *serverin, int serverinlen);
-
-/**
- * \brief send a sasl request asynchronously.
- *
- * \param zh the zookeeper handle obtained by a call to \ref zookeeper_init
- * \param zh the connection handle obtained by a call to \ref zoo_sasl_connect
- * \param clientout the token
- * \param clientoutlen the token length
- * \param cptr function to call with the server response
- * \return ZMARSHALLINGERROR if sending failed, ZOK otherwise
- */
-ZOOAPI int zoo_asasl(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *clientout,
-        unsigned clientoutlen, sasl_completion_t cptr);
-
-/**
- * \brief send a sasl request synchronously.
- *
- * \param zh the zookeeper handle obtained by a call to \ref zookeeper_init
- * \param zh the connection handle obtained by a call to \ref zoo_sasl_connect
- * \param clientout the token to send
- * \param clientoutlen the token  length
- * \param serverin the received token
- * \param serverinlen the token length
- * \return
- */
-ZOOAPI int zoo_sasl(zhandle_t *zh, zoo_sasl_conn_t *conn, const char *clientout,
-        unsigned clientoutlen, const char **serverin, unsigned *serverinlen);
-
-struct sasl_completion_ctx {
-    zhandle_t *zh;
-    zoo_sasl_conn_t *conn;
-};
 
 #ifdef __cplusplus
 extern "C" {
@@ -307,6 +271,12 @@ extern ZOOAPI const int ZOO_NOTWATCHING_EVENT;
  * \ref zookeeper_init.
  */
 typedef struct _zhandle zhandle_t;
+
+/**
+ * \brief Zookeeper SASL handle.
+ * FIXME: Document
+ */
+typedef struct _zoo_sasl_ctx zoo_sasl_conn_t;
 
 /**
  * \brief client id structure.
@@ -918,6 +888,15 @@ typedef void
  */
 typedef void (*acl_completion_t)(int rc, struct ACL_vector *acl,
         struct Stat *stat, const void *data);
+
+
+/**
+ * \brief signature of a completion function that returns an ACL.
+ * FIXME: Document
+ */
+typedef int (*sasl_completion_t)(int rc, zhandle_t *zh, zoo_sasl_conn_t *ctx,
+        const char *serverin, int serverinlen);
+
 
 /**
  * \brief get the state of the zookeeper connection.
@@ -1622,6 +1601,19 @@ ZOOAPI int zoo_aremove_all_watches(zhandle_t *zh, const char *path,
         ZooWatcherType wtype, int local, void_completion_t *completion,
         const void *data);
 
+/**
+ * \brief send a sasl request asynchronously.
+ *
+ * \param zh the zookeeper handle obtained by a call to \ref zookeeper_init
+ * \param ctx the sasl handle obtained by a call to \ref zoo_sasl_connect
+ * \param clientout the token
+ * \param clientoutlen the token length
+ * \param cptr function to call with the server response
+ * \return ZMARSHALLINGERROR if sending failed, ZOK otherwise
+ */
+ZOOAPI int zoo_asasl(zhandle_t *zh, zoo_sasl_conn_t *ctx, const char *clientout,
+        unsigned clientoutlen, sasl_completion_t cptr);
+
 #ifdef THREADED
 /**
  * \brief create a node synchronously.
@@ -2142,6 +2134,20 @@ ZOOAPI int zoo_multi(zhandle_t *zh, int count, const zoo_op_t *ops, zoo_op_resul
  */
 ZOOAPI int zoo_remove_watches(zhandle_t *zh, const char *path,
         ZooWatcherType wtype, watcher_fn watcher, void *watcherCtx, int local);
+
+/**
+ * \brief send a sasl request synchronously.
+ *
+ * \param zh the zookeeper handle obtained by a call to \ref zookeeper_init
+ * \param ctx the connection handle obtained by a call to \ref zoo_sasl_connect
+ * \param clientout the token to send
+ * \param clientoutlen the token  length
+ * \param serverin the received token
+ * \param serverinlen the token length
+ * \return
+ */
+ZOOAPI int zoo_sasl(zhandle_t *zh, zoo_sasl_conn_t *ctx, const char *clientout,
+        unsigned clientoutlen, const char **serverin, unsigned *serverinlen);
 #endif
 #ifdef __cplusplus
 }
